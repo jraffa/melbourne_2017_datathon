@@ -1,0 +1,76 @@
+---
+title: "Untitled"
+author: "Jesse D. Raffa"
+date: "March 3, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(RPostgreSQL) 
+ora_p <- readLines(".ora_")
+
+
+m <- dbDriver("PostgreSQL")
+
+con <- dbConnect(m, user="group10", password=ora_p, dbname="eicu",host="sl-us-dal-9-portal.6.dblayer.com",port=20701)
+library(plyr)
+library(dplyr); library(RPostgreSQL); library (ggplot2); library(Hmisc); library(plotly)
+
+pg_src <- src_postgres(dbname = "eicu", host = "sl-us-dal-9-portal.6.dblayer.com", port = 20701, user = "group10", password = ora_p,options="-c search_path=eicu")
+patient_tbl <- tbl(pg_src, "patient")
+
+apachepatientresult_tbl <- tbl(pg_src, "apachepatientresult")
+
+#labname=="Base Deficit" | labname=="Base Excess" | labname=="FiO2" | labname=="HCO3" | labname=="LPM O2" | labname=="Mode" | labname=="O2 Content" | labname=="O2 Sat (%)" | labname=="PEEP" | labname=="Peak Airway/Pressure" | labname=="Pressure Control" | labname=="Pressure Support" | labname=="Respiratory Rate" | labname=="Spontaneous Rate" | labname=="TV" | labname=="Temperature" | labname=="Total CO2" | labname=="Vent Other" | labname=="Vent Rate" | labname=="anion gap" | labname=="bicarbonate" | labname=="lactate" | labname=="pH" | labname=="paCO2" | labname=="paO2" #For later
+
+
+lab_tbl <- tbl(pg_src,"lab")
+
+
+pop <- patient_tbl %>% select(patientunitstayid,patienthealthsystemstayid,apacheadmissiondx,gender,age,ethnicity,unittype,unitvisitnumber,admissionweight,unitadmittime,unitdischargetime,uniquepid) %>% inner_join(apachepatientresult_tbl %>% filter(actualventdays>=1),by="patientunitstayid"); 
+
+
+
+
+#labname=="PEEP" | labname=="Peak Airway/Pressure" ph, TV pcaco2
+
+lab_55 <- lab_tbl %>% filter(labname=="paCO2") %>% select(patientunitstayid,labresult,labresultoffset,labname) %>%  arrange(patientunitstayid,labresultoffset) %>% group_by(patientunitstayid) %>% filter(labresult>=55) %>%  mutate(minTime55=min(labresultoffset)) %>% filter(minTime55>=0 & labresultoffset==minTime55) %>% collect(n=Inf)
+
+lab_55_seq <- lab_tbl %>% filter(labname=="paCO2") %>% select(patientunitstayid,labresult,labresultoffset,labname) %>%  arrange(patientunitstayid,labresultoffset) %>% group_by(patientunitstayid) %>% collect(n=Inf) %>%  full_join(lab_55 %>% select(minTime55,patientunitstayid,idxResult=labresult),copy=TRUE) %>% filter(labresultoffset>minTime55 + 8*60 &  labresultoffset < minTime55 + 16*60) %>% collect(n=Inf) %>% group_by(patientunitstayid) %>% filter(labresult==min(labresult)) %>% arrange(labresultoffset) %>% slice(1) %>% ungroup()
+
+apachepatientresult <- apachepatientresult_tbl %>% collect(n=Inf)
+
+dat <- lab_55_seq %>% inner_join(apachepatientresult %>% filter(actualventdays>=1) %>% filter(apacheversion=="IVa"),by="patientunitstayid") %>% inner_join(patient_tbl,by="patientunitstayid",copy=TRUE)
+
+dat$dCO2 <- -(dat$idxResult-dat$labresult)
+
+
+prop.table(table(cut2(dat$dCO2,c(-40,-25,-5,5)),dat$actualhospitalmortality),1)
+dat2 <- dat %>% mutate(dgroup=cut2(dCO2,c(-40,-25,-5,5)), bgroup=cut2(idxResult,c(75)),mort=as.numeric(actualhospitalmortality=="EXPIRED"),nagroup=cut2(labresult,c(45,55)),normdCO2=dCO2/(labresultoffset-minTime55),normCO2group=cut2(normdCO2,c(-0.043,-0.02,0))) %>% filter(!is.na(dgroup))
+
+
+
+ggplotly(ggplot(dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)") %>% group_by(bgroup,dgroup) %>% summarise(n=n(),mortRate=mean(as.numeric(actualhospitalmortality=="EXPIRED"))) %>% filter(!is.na(mortRate) & !is.na(dgroup)) %>% mutate(UL=mortRate + 1.96*sqrt(mortRate*(1-mortRate)/n),LL=mortRate - 1.96*sqrt(mortRate*(1-mortRate)/n)),aes(dgroup,mortRate,group=bgroup,col=bgroup)) + geom_line() + geom_ribbon(aes(ymax=UL,ymin=LL,fill=bgroup),alpha=0.3))
+
+ggplot(dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)") %>% group_by(bgroup,dgroup) %>% summarise(n=n(),mortRate=mean(as.numeric(actualhospitalmortality=="EXPIRED"))) %>% filter(!is.na(mortRate) & !is.na(dgroup)) %>% mutate(UL=mortRate + 1.96*sqrt(mortRate*(1-mortRate)/n),LL=mortRate - 1.96*sqrt(mortRate*(1-mortRate)/n)),aes(dgroup,mortRate,group=bgroup,col=bgroup)) + geom_line() + geom_ribbon(aes(ymax=UL,ymin=LL,fill=bgroup),alpha=0.3) + xlab("Change in CO2 From >55") + ylab("Hosp. Morality Rate") +  scale_fill_discrete(name="Initial CO2")
+
+drop1(bb <- glm(actualhospitalmortality=="EXPIRED" ~ dgroup + bgroup +  apachescore,data=dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)"),family="binomial" ),test="Chisq")
+
+ggplotly(ggplot(dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)") %>% group_by(bgroup,normCO2group) %>% summarise(n=n(),mortRate=mean(as.numeric(actualhospitalmortality=="EXPIRED"))) %>% filter(!is.na(mortRate) & !is.na(normCO2group)) %>% mutate(UL=mortRate + 1.96*sqrt(mortRate*(1-mortRate)/n),LL=mortRate - 1.96*sqrt(mortRate*(1-mortRate)/n)),aes(normCO2group,mortRate,group=bgroup,col=bgroup)) + geom_line() + geom_ribbon(aes(ymax=UL,ymin=LL,fill=bgroup),alpha=0.3))
+
+
+ggplot(dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)") %>% group_by(bgroup,normCO2group) %>% summarise(n=n(),mortRate=mean(as.numeric(actualhospitalmortality=="EXPIRED"))) %>% filter(!is.na(mortRate) & !is.na(normCO2group)) %>% mutate(UL=mortRate + 1.96*sqrt(mortRate*(1-mortRate)/n),LL=mortRate - 1.96*sqrt(mortRate*(1-mortRate)/n)),aes(normCO2group,mortRate,group=bgroup,col=bgroup)) + geom_line() + geom_ribbon(aes(ymax=UL,ymin=LL,fill=bgroup),alpha=0.3) + xlab("Normalized Change in CO2") + ylab("Hosp. Mortality Rate")  + scale_fill_discrete(name="Initial CO2")
+
+
+drop1(bb <- glm(actualhospitalmortality=="EXPIRED" ~ normCO2group + bgroup +  apachescore,data=dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" | apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)"),family="binomial" ),test="Chisq")
+
+
+
+library(mgcv)
+plot(b <- gam(actualhospitalmortality=="EXPIRED" ~ s(idxResult,dCO2) + s(apachescore),data=dat2 %>% filter(apacheadmissiondx!="Emphysema/bronchitis" & apacheadmissiondx!="Restrictive lung disease (i.e., Sarcoidosis, pulmonary fibrosis)"),family="binomial"))
+
+grids <- expand.grid(dCO2=seq(-50,30),idxResult=seq(55,100),apachescore=c(10,20,30,40,50,60))
+grids$pred <- predict(b,grids)
+ggplot(grids,aes(dCO2,idxResult,z=plogis(pred) )) + stat_summary_2d(fun="mean") +  scale_fill_gradientn(colors=rev(c("red","orange","yellow","green","cyan","blue","purple"))) + facet_wrap(~apachescore)
+
+```
